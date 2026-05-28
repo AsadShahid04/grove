@@ -24,7 +24,6 @@ import (
 	grovecorev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
 	componentutils "github.com/ai-dynamo/grove/operator/internal/controller/common/component/utils"
 	grovectrlutils "github.com/ai-dynamo/grove/operator/internal/controller/utils"
-	grovemetrics "github.com/ai-dynamo/grove/operator/internal/metrics"
 	"github.com/ai-dynamo/grove/operator/internal/utils"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -66,7 +65,7 @@ func (r *Reconciler) RegisterWithManager(mgr manager.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(mapPodCliqueScaleGroupToPodCliqueSet()),
 			builder.WithPredicates(podCliqueScalingGroupPredicate()),
 		).
-		Complete(grovemetrics.NewObservedReconciler(controllerName, r))
+		Complete(r)
 }
 
 // mapPodCliqueToPodCliqueSet returns a function that maps PodClique events to their parent PodCliqueSet.

@@ -74,19 +74,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return result.Result()
 	}
 
-	doneSpec := grovemetrics.StartOperation(controllerName, "reconcile_spec")
 	reconcileSpecFlowResult := r.reconcileSpec(ctx, logger, pcs)
-	doneSpec()
-
-	doneStatus := grovemetrics.StartOperation(controllerName, "reconcile_status")
 	statusReconcileResult := r.reconcileStatus(ctx, logger, pcs)
-	doneStatus()
 
 	if ctrlcommon.ShortCircuitReconcileFlow(statusReconcileResult) {
-		return statusReconcileResult.Result()
+		result, err := statusReconcileResult.Result()
+		grovemetrics.RecordReconcileError(controllerName, err)
+		return result, err
 	}
 
-	return reconcileSpecFlowResult.Result()
+	result, err := reconcileSpecFlowResult.Result()
+	grovemetrics.RecordReconcileError(controllerName, err)
+	return result, err
 }
 
 // reconcileDelete handles PodCliqueSet deletion when a deletion timestamp is set.

@@ -17,109 +17,63 @@
 package metrics
 
 import (
-	"context"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-type fakeReconciler struct {
-	result ctrl.Result
-	err    error
-}
-
-func (f *fakeReconciler) Reconcile(_ context.Context, _ reconcile.Request) (ctrl.Result, error) {
-	return f.result, f.err
-}
-
-func TestObservedReconciler_Success(t *testing.T) {
-	ctrlName := "t-success"
-	observed := NewObservedReconciler(ctrlName, &fakeReconciler{result: ctrl.Result{}})
-
-	_, err := observed.Reconcile(context.Background(), reconcile.Request{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if got := testutil.ToFloat64(reconcileTotal.WithLabelValues(ctrlName, "success")); got != 1 {
-		t.Errorf("reconcile_total{result=success} = %v, want 1", got)
-	}
-	// in-flight gauge must be zero after the reconcile completes.
-	if got := testutil.ToFloat64(inFlightReconciles.WithLabelValues(ctrlName)); got != 0 {
-		t.Errorf("in_flight_reconciles = %v, want 0", got)
+func TestRecordStatusUpdateConflict(t *testing.T) {
+	ctrl, kind := "pcs-test-conflict", "PodCliqueSet"
+	before := testutil.ToFloat64(statusUpdateConflictTotal.WithLabelValues(ctrl, kind))
+	RecordStatusUpdateConflict(ctrl, kind)
+	after := testutil.ToFloat64(statusUpdateConflictTotal.WithLabelValues(ctrl, kind))
+	if after-before != 1 {
+		t.Errorf("status_update_conflict_total delta = %v, want 1", after-before)
 	}
 }
 
-func TestObservedReconciler_Error(t *testing.T) {
-	ctrlName := "t-error"
-	observed := NewObservedReconciler(ctrlName, &fakeReconciler{err: fmt.Errorf("inner error")})
-
-	_, _ = observed.Reconcile(context.Background(), reconcile.Request{})
-
-	if got := testutil.ToFloat64(reconcileTotal.WithLabelValues(ctrlName, "error")); got != 1 {
-		t.Errorf("reconcile_total{result=error} = %v, want 1", got)
+func TestRecordReconcileError_Conflict(t *testing.T) {
+	ctrl := "pcs-test-err-conflict"
+	err := apierrors.NewConflict(schema.GroupResource{Group: "core.grove.io", Resource: "podcliqueset"}, "obj", fmt.Errorf("modified"))
+	before := testutil.ToFloat64(reconcileErrorsTotal.WithLabelValues(ctrl, "conflict"))
+	RecordReconcileError(ctrl, err)
+	after := testutil.ToFloat64(reconcileErrorsTotal.WithLabelValues(ctrl, "conflict"))
+	if after-before != 1 {
+		t.Errorf("reconcile_errors_total{error_type=conflict} delta = %v, want 1", after-before)
 	}
 }
 
-func TestObservedReconciler_Conflict(t *testing.T) {
-	ctrlName := "t-conflict"
-	conflictErr := apierrors.NewConflict(
-		schema.GroupResource{Group: "core.grove.io", Resource: "podcliqueset"},
-		"my-pcs",
-		fmt.Errorf("object modified"),
-	)
-	observed := NewObservedReconciler(ctrlName, &fakeReconciler{err: conflictErr})
-
-	_, _ = observed.Reconcile(context.Background(), reconcile.Request{})
-
-	if got := testutil.ToFloat64(conflictTotal.WithLabelValues(ctrlName)); got != 1 {
-		t.Errorf("conflict_total = %v, want 1", got)
-	}
-	// conflicts are also counted as errors in reconcile_total.
-	if got := testutil.ToFloat64(reconcileTotal.WithLabelValues(ctrlName, "error")); got != 1 {
-		t.Errorf("reconcile_total{result=error} = %v, want 1 for conflict", got)
+func TestRecordReconcileError_NotFound(t *testing.T) {
+	ctrl := "pcs-test-err-notfound"
+	err := apierrors.NewNotFound(schema.GroupResource{Resource: "podcliqueset"}, "obj")
+	before := testutil.ToFloat64(reconcileErrorsTotal.WithLabelValues(ctrl, "not_found"))
+	RecordReconcileError(ctrl, err)
+	after := testutil.ToFloat64(reconcileErrorsTotal.WithLabelValues(ctrl, "not_found"))
+	if after-before != 1 {
+		t.Errorf("reconcile_errors_total{error_type=not_found} delta = %v, want 1", after-before)
 	}
 }
 
-func TestObservedReconciler_Requeue(t *testing.T) {
-	ctrlName := "t-requeue"
-	observed := NewObservedReconciler(ctrlName, &fakeReconciler{result: ctrl.Result{Requeue: true}})
-
-	_, _ = observed.Reconcile(context.Background(), reconcile.Request{})
-
-	if got := testutil.ToFloat64(reconcileTotal.WithLabelValues(ctrlName, "requeue")); got != 1 {
-		t.Errorf("reconcile_total{result=requeue} = %v, want 1", got)
+func TestRecordReconcileError_Unknown(t *testing.T) {
+	ctrl := "pcs-test-err-unknown"
+	before := testutil.ToFloat64(reconcileErrorsTotal.WithLabelValues(ctrl, "unknown"))
+	RecordReconcileError(ctrl, fmt.Errorf("some unexpected error"))
+	after := testutil.ToFloat64(reconcileErrorsTotal.WithLabelValues(ctrl, "unknown"))
+	if after-before != 1 {
+		t.Errorf("reconcile_errors_total{error_type=unknown} delta = %v, want 1", after-before)
 	}
 }
 
-func TestObservedReconciler_RequeueAfter(t *testing.T) {
-	ctrlName := "t-requeue-after"
-	observed := NewObservedReconciler(ctrlName, &fakeReconciler{result: ctrl.Result{RequeueAfter: 5 * time.Second}})
-
-	_, _ = observed.Reconcile(context.Background(), reconcile.Request{})
-
-	if got := testutil.ToFloat64(reconcileTotal.WithLabelValues(ctrlName, "requeue_after")); got != 1 {
-		t.Errorf("reconcile_total{result=requeue_after} = %v, want 1", got)
-	}
-}
-
-func TestStartOperation_PopulatesHistogram(t *testing.T) {
-	// CollectAndCount returns the number of series present in the histogram vec.
-	// Before calling StartOperation with a fresh label combo the count is 0.
-	before := testutil.CollectAndCount(operationDuration)
-
-	done := StartOperation("t-op-ctrl", "reconcile_spec")
-	time.Sleep(time.Millisecond)
-	done()
-
-	after := testutil.CollectAndCount(operationDuration)
-	if after <= before {
-		t.Errorf("operation_duration_seconds count did not increase: before=%d after=%d", before, after)
+func TestRecordReconcileError_Nil(t *testing.T) {
+	// Calling with nil should be a no-op; verify no panic and counter stays zero.
+	ctrl := "pcs-test-err-nil"
+	before := testutil.CollectAndCount(reconcileErrorsTotal)
+	RecordReconcileError(ctrl, nil)
+	after := testutil.CollectAndCount(reconcileErrorsTotal)
+	if after != before {
+		t.Errorf("reconcile_errors_total series count changed on nil error: before=%d after=%d", before, after)
 	}
 }

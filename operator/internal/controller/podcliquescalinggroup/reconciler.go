@@ -79,22 +79,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		dLog := logger.WithValues("operation", "delete")
 		deletionOrSpecReconcileFlowResult = r.triggerDeletionFlow(ctx, dLog, pcsg)
 	} else {
-		doneSpec := grovemetrics.StartOperation(controllerName, "reconcile_spec")
 		specLog := logger.WithValues("operation", "specReconcile")
 		deletionOrSpecReconcileFlowResult = r.reconcileSpec(ctx, specLog, pcsg)
-		doneSpec()
 	}
 
-	doneStatus := grovemetrics.StartOperation(controllerName, "reconcile_status")
 	statusReconcileResult := r.reconcileStatus(ctx, logger, ctrlclient.ObjectKeyFromObject(pcsg))
-	doneStatus()
 
 	if ctrlcommon.ShortCircuitReconcileFlow(statusReconcileResult) {
-		return statusReconcileResult.Result()
+		result, err := statusReconcileResult.Result()
+		grovemetrics.RecordReconcileError(controllerName, err)
+		return result, err
 	}
 
 	if ctrlcommon.ShortCircuitReconcileFlow(deletionOrSpecReconcileFlowResult) {
-		return deletionOrSpecReconcileFlowResult.Result()
+		result, err := deletionOrSpecReconcileFlowResult.Result()
+		grovemetrics.RecordReconcileError(controllerName, err)
+		return result, err
 	}
 
 	return ctrlcommon.DoNotRequeue().Result()
