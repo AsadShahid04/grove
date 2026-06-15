@@ -19,13 +19,51 @@ package clustertopology
 import (
 	"context"
 	"fmt"
+	"time"
 
 	grovecorev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
 	"github.com/ai-dynamo/grove/operator/internal/scheduler"
 
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+// DefaultSyncRetryBackoff is the retry backoff used by SynchronizeTopologyWithRetry.
+// Six steps with doubling delay gives roughly 60 seconds of retry budget (1+2+4+8+16+32).
+var DefaultSyncRetryBackoff = wait.Backoff{
+	Duration: time.Second,
+	Factor:   2.0,
+	Jitter:   0.1,
+	Steps:    6,
+}
+
+// SynchronizeTopologyWithRetry wraps SynchronizeTopology with a bounded exponential
+// backoff so that transient API-server errors (5xx, timeouts, service-unavailable)
+// at operator startup do not crash the operator process.
+// Permanent errors (Forbidden, Unauthorized) are returned immediately without retrying.
+func SynchronizeTopologyWithRetry(ctx context.Context, cl client.Client, logger logr.Logger, backends map[string]scheduler.TopologyAwareBackend, backoff wait.Backoff) error {
+	attempt := 0
+	return retry.OnError(backoff, isTransientAPIError, func() error {
+		if attempt > 0 {
+			logger.Info("Retrying topology synchronization after transient error", "attempt", attempt+1)
+		}
+		attempt++
+		return SynchronizeTopology(ctx, cl, logger, backends)
+	})
+}
+
+// isTransientAPIError reports whether err is a transient Kubernetes API server error
+// that is safe to retry. Permanent errors (Forbidden, Unauthorized) return false.
+func isTransientAPIError(err error) bool {
+	return apierrors.IsServerTimeout(err) ||
+		apierrors.IsServiceUnavailable(err) ||
+		apierrors.IsInternalError(err) ||
+		apierrors.IsTimeout(err) ||
+		apierrors.IsTooManyRequests(err)
+}
 
 // SynchronizeTopology synchronizes scheduler-specific topology resources at operator startup.
 // Lists all existing ClusterTopologyBinding resources and ensures backend topologies exist for each.
