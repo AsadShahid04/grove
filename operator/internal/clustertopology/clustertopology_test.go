@@ -18,6 +18,10 @@ package clustertopology
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"net"
+	"syscall"
 	"testing"
 	"time"
 
@@ -380,6 +384,91 @@ func TestSynchronizeTopologyWithRetry_ExhaustsRetriesOnPersistentTransientError(
 	err := SynchronizeTopologyWithRetry(ctx, cl, logr.Discard(), newKaiBackends(cl), shortBackoff)
 	require.Error(t, err, "should fail after exhausting retry budget")
 	assert.True(t, apierrors.IsServiceUnavailable(err))
+}
+
+// mockTimeoutError is a net.Error that reports Timeout() == true, mimicking a
+// transport-level dial timeout (e.g. API server rolling restart, network partition).
+type mockTimeoutError struct{}
+
+func (mockTimeoutError) Error() string   { return "i/o timeout" }
+func (mockTimeoutError) Timeout() bool   { return true }
+func (mockTimeoutError) Temporary() bool { return true }
+
+func TestIsTransientAPIError(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		wantRetry bool
+	}{
+		{
+			name:      "apierrors.InternalError is transient",
+			err:       apierrors.NewInternalError(fmt.Errorf("internal")),
+			wantRetry: true,
+		},
+		{
+			name:      "apierrors.ServiceUnavailable is transient",
+			err:       apierrors.NewServiceUnavailable("unavailable"),
+			wantRetry: true,
+		},
+		{
+			name:      "apierrors.Forbidden is permanent",
+			err:       apierrors.NewForbidden(schema.GroupResource{}, "", fmt.Errorf("denied")),
+			wantRetry: false,
+		},
+		{
+			name:      "net.Error timeout is transient",
+			err:       mockTimeoutError{},
+			wantRetry: true,
+		},
+		{
+			name:      "io.EOF is transient",
+			err:       io.EOF,
+			wantRetry: true,
+		},
+		{
+			name:      "ECONNREFUSED is transient",
+			err:       syscall.ECONNREFUSED,
+			wantRetry: true,
+		},
+		{
+			name:      "wrapped net.Error timeout is transient",
+			err:       fmt.Errorf("wrapped: %w", mockTimeoutError{}),
+			wantRetry: true,
+		},
+		{
+			name:      "wrapped ECONNREFUSED is transient",
+			err:       fmt.Errorf("wrapped: %w", syscall.ECONNREFUSED),
+			wantRetry: true,
+		},
+		{
+			name:      "net.Error non-timeout is not transient",
+			err:       &net.OpError{Err: fmt.Errorf("some non-timeout net error")},
+			wantRetry: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.wantRetry, isTransientAPIError(tc.err))
+		})
+	}
+}
+
+func TestSynchronizeTopologyWithRetry_TransportErrorRetried(t *testing.T) {
+	ctx := context.Background()
+	ct := createTestClusterTopology(topologyName, []grovecorev1alpha1.TopologyLevel{
+		{Domain: grovecorev1alpha1.TopologyDomainHost, Key: "kubernetes.io/hostname"},
+	})
+	base := testutils.CreateDefaultFakeClient([]client.Object{ct})
+	// Inject a transport-level timeout for the first 2 List calls; the 3rd succeeds.
+	cl := &transientListClient{
+		Client:    base,
+		failCount: 2,
+		failErr:   mockTimeoutError{},
+	}
+
+	err := SynchronizeTopologyWithRetry(ctx, cl, logr.Discard(), newKaiBackends(base), fastBackoff)
+	require.NoError(t, err)
+	assert.Equal(t, 3, cl.callCount, "expected 2 transient transport failures then 1 success")
 }
 
 func TestBuildSchedulerReferenceMap(t *testing.T) {

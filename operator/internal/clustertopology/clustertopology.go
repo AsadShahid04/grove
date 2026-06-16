@@ -18,7 +18,11 @@ package clustertopology
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net"
+	"syscall"
 	"time"
 
 	grovecorev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
@@ -55,14 +59,25 @@ func SynchronizeTopologyWithRetry(ctx context.Context, cl client.Client, logger 
 	})
 }
 
-// isTransientAPIError reports whether err is a transient Kubernetes API server error
-// that is safe to retry. Permanent errors (Forbidden, Unauthorized) return false.
+// isTransientAPIError reports whether err is a transient error that is safe to retry.
+// It covers both Kubernetes API-level errors (5xx, timeouts) and transport-level
+// errors (connection refused, EOF, net timeout) that surface before a StatusError
+// is returned — e.g. during an API-server rolling restart or network partition.
+// Permanent errors (Forbidden, Unauthorized) return false.
 func isTransientAPIError(err error) bool {
-	return apierrors.IsServerTimeout(err) ||
+	if apierrors.IsServerTimeout(err) ||
 		apierrors.IsServiceUnavailable(err) ||
 		apierrors.IsInternalError(err) ||
 		apierrors.IsTimeout(err) ||
-		apierrors.IsTooManyRequests(err)
+		apierrors.IsTooManyRequests(err) {
+		return true
+	}
+	// Transport-level transient errors.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNREFUSED)
 }
 
 // SynchronizeTopology synchronizes scheduler-specific topology resources at operator startup.
