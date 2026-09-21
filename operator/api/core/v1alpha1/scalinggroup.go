@@ -55,6 +55,7 @@ type PodCliqueScalingGroupList struct {
 }
 
 // PodCliqueScalingGroupSpec is the specification of the PodCliqueScalingGroup.
+// +kubebuilder:validation:XValidation:rule="!has(self.minAvailable) || self.replicas >= self.minAvailable",message="replicas must be greater than or equal to minAvailable"
 type PodCliqueScalingGroupSpec struct {
 	// Replicas is the desired number of replicas for the PodCliqueScalingGroup.
 	// If not specified, it defaults to 1.
