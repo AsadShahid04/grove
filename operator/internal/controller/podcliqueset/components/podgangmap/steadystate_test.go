@@ -443,3 +443,114 @@ func pcsg(replicas int32) grovecorev1alpha1.PodCliqueScalingGroup {
 		Spec: grovecorev1alpha1.PodCliqueScalingGroupSpec{Replicas: replicas, MinAvailable: ptr.To(int32(2))},
 	}
 }
+
+func TestDrainReplicaIndicesForScaleInRespectsMinAvailable(t *testing.T) {
+	tests := []struct {
+		name         string
+		entries      []grovecorev1alpha1.PodGangEntry
+		pcsgName     string
+		count        int
+		minAvailable int32
+		assertResult func(t *testing.T, entries []grovecorev1alpha1.PodGangEntry)
+	}{
+		{
+			name: "drains scaleout only, leaves anchor minAvailable untouched",
+			entries: []grovecorev1alpha1.PodGangEntry{
+				anchorEntry(nil, map[string][]int32{testPCSGName: {0, 1}}),
+				scaleOutEntry(map[string][]int32{testPCSGName: {2, 3}}),
+			},
+			pcsgName:     testPCSGName,
+			count:        2,
+			minAvailable: 2,
+			assertResult: func(t *testing.T, entries []grovecorev1alpha1.PodGangEntry) {
+				anchor := testutils.EntryByRole(entries, grovecorev1alpha1.PodGangEntryRoleAnchor)
+				scaleOut := testutils.EntryByRole(entries, grovecorev1alpha1.PodGangEntryRoleScaleOut)
+				assert.Equal(t, []int32{0, 1}, anchor.PCSGReplicaIndices[testPCSGName], "anchor should keep minAvailable indices")
+				assert.Empty(t, scaleOut.PCSGReplicaIndices[testPCSGName], "scaleout should be drained")
+			},
+		},
+		{
+			name: "drains tail then stops at anchor minAvailable",
+			entries: []grovecorev1alpha1.PodGangEntry{
+				anchorEntry(nil, map[string][]int32{testPCSGName: {0, 1, 2}}),
+				tailEntry(map[string][]int32{testPCSGName: {3, 4}}),
+				scaleOutEntry(nil),
+			},
+			pcsgName:     testPCSGName,
+			count:        3,
+			minAvailable: 2,
+			assertResult: func(t *testing.T, entries []grovecorev1alpha1.PodGangEntry) {
+				anchor := testutils.EntryByRole(entries, grovecorev1alpha1.PodGangEntryRoleAnchor)
+				tail := testutils.EntryByRole(entries, grovecorev1alpha1.PodGangEntryRoleTail)
+				// Should drain all of tail (2 indices), then 1 from anchor, but keep indices 0,1 (minAvailable=2)
+				assert.Equal(t, []int32{0, 1}, anchor.PCSGReplicaIndices[testPCSGName], "anchor should keep indices below minAvailable")
+				assert.Empty(t, tail.PCSGReplicaIndices[testPCSGName], "tail should be fully drained")
+			},
+		},
+		{
+			name: "defense in depth: never drains anchor below minAvailable even if requested",
+			entries: []grovecorev1alpha1.PodGangEntry{
+				anchorEntry(nil, map[string][]int32{testPCSGName: {0, 1, 2}}),
+				scaleOutEntry(nil),
+			},
+			pcsgName:     testPCSGName,
+			count:        5,
+			minAvailable: 2,
+			assertResult: func(t *testing.T, entries []grovecorev1alpha1.PodGangEntry) {
+				anchor := testutils.EntryByRole(entries, grovecorev1alpha1.PodGangEntryRoleAnchor)
+				// Should only drain index 2, keeping 0 and 1 (the minAvailable indices)
+				assert.Equal(t, []int32{0, 1}, anchor.PCSGReplicaIndices[testPCSGName], "anchor must never go below minAvailable")
+			},
+		},
+		{
+			name: "allows draining when minAvailable is zero",
+			entries: []grovecorev1alpha1.PodGangEntry{
+				anchorEntry(nil, map[string][]int32{testPCSGName: {0, 1}}),
+				scaleOutEntry(nil),
+			},
+			pcsgName:     testPCSGName,
+			count:        2,
+			minAvailable: 0,
+			assertResult: func(t *testing.T, entries []grovecorev1alpha1.PodGangEntry) {
+				anchor := testutils.EntryByRole(entries, grovecorev1alpha1.PodGangEntryRoleAnchor)
+				assert.Empty(t, anchor.PCSGReplicaIndices[testPCSGName], "should drain all when minAvailable is 0")
+			},
+		},
+		{
+			name: "allows draining when minAvailable is not set (treated as 0)",
+			entries: []grovecorev1alpha1.PodGangEntry{
+				anchorEntry(nil, map[string][]int32{testPCSGName: {0, 1}}),
+				scaleOutEntry(nil),
+			},
+			pcsgName:     testPCSGName,
+			count:        2,
+			minAvailable: 0,
+			assertResult: func(t *testing.T, entries []grovecorev1alpha1.PodGangEntry) {
+				anchor := testutils.EntryByRole(entries, grovecorev1alpha1.PodGangEntryRoleAnchor)
+				assert.Empty(t, anchor.PCSGReplicaIndices[testPCSGName], "should drain all when minAvailable is unset")
+			},
+		},
+		{
+			name: "drains highest indices first within anchor",
+			entries: []grovecorev1alpha1.PodGangEntry{
+				anchorEntry(nil, map[string][]int32{testPCSGName: {0, 1, 5, 7}}),
+				scaleOutEntry(nil),
+			},
+			pcsgName:     testPCSGName,
+			count:        2,
+			minAvailable: 2,
+			assertResult: func(t *testing.T, entries []grovecorev1alpha1.PodGangEntry) {
+				anchor := testutils.EntryByRole(entries, grovecorev1alpha1.PodGangEntryRoleAnchor)
+				// Should drain highest indices (7, 5) and keep the minAvailable indices (0, 1)
+				assert.Equal(t, []int32{0, 1}, anchor.PCSGReplicaIndices[testPCSGName], "should keep lowest indices")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			drainReplicaIndicesForScaleIn(tt.entries, tt.pcsgName, tt.count, tt.minAvailable)
+			tt.assertResult(t, tt.entries)
+		})
+	}
+}

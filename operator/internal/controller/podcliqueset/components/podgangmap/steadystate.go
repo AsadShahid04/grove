@@ -196,7 +196,11 @@ func reconcilePCSGReplicaIndices(entries []grovecorev1alpha1.PodGangEntry, pcs *
 		case diff > 0:
 			appendScaleOutReplicaIndices(entries, pcsgConfigName, lo.RangeFrom[int32](int32(currentCount), diff))
 		case diff < 0:
-			drainReplicaIndicesForScaleIn(entries, pcsgConfigName, -diff)
+			minAvail := int32(0)
+			if pcsg.Spec.MinAvailable != nil {
+				minAvail = *pcsg.Spec.MinAvailable
+			}
+			drainReplicaIndicesForScaleIn(entries, pcsgConfigName, -diff, minAvail)
 		}
 	}
 	return nil
@@ -230,9 +234,9 @@ func appendScaleOutReplicaIndices(entries []grovecorev1alpha1.PodGangEntry, pcsg
 
 // drainReplicaIndicesForScaleIn removes count of the given PodCliqueScalingGroup's replica indices,
 // draining in role order ScaleOut, then Tail, then Anchor (highest AnchorIndex first, AnchorIndex 0
-// last), and the highest index first within a chosen entry. The webhook guarantees Spec.Replicas
-// stays at or above MinAvailable, so the anchor's MinAvailable indices are never drained.
-func drainReplicaIndicesForScaleIn(entries []grovecorev1alpha1.PodGangEntry, pcsgConfigName string, count int) {
+// last), and the highest index first within a chosen entry. Defense in depth: even if Spec.Replicas
+// somehow falls below MinAvailable, anchor indices below minAvailable are never drained.
+func drainReplicaIndicesForScaleIn(entries []grovecorev1alpha1.PodGangEntry, pcsgConfigName string, count int, minAvailable int32) {
 	order := make([]int, 0, len(entries))
 	for i := range entries {
 		if len(entries[i].PCSGReplicaIndices[pcsgConfigName]) > 0 {
@@ -257,6 +261,20 @@ func drainReplicaIndicesForScaleIn(entries []grovecorev1alpha1.PodGangEntry, pcs
 		s := entries[idx].PCSGReplicaIndices[pcsgConfigName]
 		slices.Sort(s)
 		take := min(remaining, len(s))
+		// Defense in depth: never drain anchor indices below minAvailable, even if
+		// validation somehow failed. Anchor entries hold the lowest indices by construction.
+		if entries[idx].Role == grovecorev1alpha1.PodGangEntryRoleAnchor && minAvailable > 0 {
+			// Count how many indices are below minAvailable
+			belowMinAvailable := 0
+			for _, replicaIdx := range s {
+				if replicaIdx < minAvailable {
+					belowMinAvailable++
+				}
+			}
+			// Ensure we keep all indices below minAvailable
+			maxDrainable := len(s) - belowMinAvailable
+			take = min(take, maxDrainable)
+		}
 		entries[idx].PCSGReplicaIndices[pcsgConfigName] = s[:len(s)-take]
 		remaining -= take
 	}
