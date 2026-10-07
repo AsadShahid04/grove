@@ -186,6 +186,16 @@ func (r _resource) reconcilePCSGLabellessPods(ctx context.Context, logger logr.L
 // runSyncFlow executes the main synchronization logic including pod creation, deletion, updates, and scheduling gate management
 func (r _resource) runSyncFlow(ctx context.Context, logger logr.Logger, ss *syncSnapshot) syncFlowResult {
 	result := syncFlowResult{}
+
+	// Delete terminal pods (Failed/Succeeded) so they can be replaced. This ensures pods that have
+	// reached a terminal state are cleaned up and recreated, consistent with how other unhealthy
+	// pods are handled. Terminal pods are deleted before regular reconciliation so their indices
+	// can be reused by replacement pods in the same reconcile cycle.
+	if err := r.deleteTerminalPods(ctx, logger, ss); err != nil {
+		result.recordError(err)
+		return result
+	}
+
 	if ss.isStandalonePCLQ {
 		// A standalone PodClique's pods are distributed across one or more anchor PodGangs, so its
 		// pods are reconciled per PodGang against the PodGangMap counts.
@@ -246,6 +256,36 @@ func (r _resource) runSyncFlow(ctx context.Context, logger logr.Logger, ss *sync
 	}
 	result.recordPendingScheduleGatedPods(skippedScheduleGatedPods)
 	return result
+}
+
+// deleteTerminalPods deletes all pods in terminal phases (Failed or Succeeded) so they can be
+// replaced. Terminal pods do not count toward availability and should not consume pod indices.
+// Deleting them allows the controller to create replacement pods in the same reconcile cycle.
+func (r _resource) deleteTerminalPods(ctx context.Context, logger logr.Logger, ss *syncSnapshot) error {
+	terminalPods := lo.Filter(ss.existingPCLQPods, func(pod *corev1.Pod, _ int) bool {
+		return k8sutils.IsPodTerminal(pod) && !k8sutils.IsResourceTerminating(pod.ObjectMeta)
+	})
+
+	if len(terminalPods) == 0 {
+		return nil
+	}
+
+	logger.Info("Deleting terminal pods for replacement", "count", len(terminalPods))
+	for _, pod := range terminalPods {
+		if err := r.client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+			return groveerr.WrapError(err,
+				errCodeDeletePod,
+				component.OperationSync,
+				fmt.Sprintf("failed to delete terminal pod %v", client.ObjectKeyFromObject(pod)),
+			)
+		}
+		logger.Info("Deleted terminal pod", "pod", client.ObjectKeyFromObject(pod), "phase", pod.Status.Phase)
+	}
+
+	// Requeue to allow the deletion to be observed before creating replacements
+	return groveerr.New(groveerr.ErrCodeRequeueAfter,
+		component.OperationSync,
+		fmt.Sprintf("deleted %d terminal pod(s) for PodClique %v, requeuing for replacement", len(terminalPods), client.ObjectKeyFromObject(ss.pclq)))
 }
 
 // syncPCSGPodIndexLabels backfills and reconciles the group-wide index label on existing PCSG pods.

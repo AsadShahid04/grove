@@ -774,3 +774,114 @@ func TestCategorizePodsByConditionType(t *testing.T) {
 	assert.Len(t, categories[PodStartedButNotReady], 1)
 	assert.Equal(t, "started-not-ready-pod", categories[PodStartedButNotReady][0].Name)
 }
+
+func TestIsPodTerminal(t *testing.T) {
+	testCases := []struct {
+		description    string
+		phase          corev1.PodPhase
+		expectedResult bool
+	}{
+		{
+			description:    "Pod in Running phase is not terminal",
+			phase:          corev1.PodRunning,
+			expectedResult: false,
+		},
+		{
+			description:    "Pod in Pending phase is not terminal",
+			phase:          corev1.PodPending,
+			expectedResult: false,
+		},
+		{
+			description:    "Pod in Failed phase is terminal",
+			phase:          corev1.PodFailed,
+			expectedResult: true,
+		},
+		{
+			description:    "Pod in Succeeded phase is terminal",
+			phase:          corev1.PodSucceeded,
+			expectedResult: true,
+		},
+		{
+			description:    "Pod with unknown phase is not terminal",
+			phase:          corev1.PodUnknown,
+			expectedResult: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.description, func(t *testing.T) {
+			pod := testutils.NewPodWithBuilderWithDefaultSpec(testPodName, testPodNamespace).
+				WithPhase(tc.phase).
+				Build()
+			assert.Equal(t, tc.expectedResult, IsPodTerminal(pod))
+		})
+	}
+}
+
+func TestCategorizePodsByConditionType_TerminalPodsNotCountedAsScheduled(t *testing.T) {
+	// Failed pod with PodScheduled=True should not be counted as scheduled
+	failedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "failed-pod",
+			Namespace: testPodNamespace,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   corev1.PodScheduled,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+
+	// Succeeded pod with PodScheduled=True should not be counted as scheduled
+	succeededPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "succeeded-pod",
+			Namespace: testPodNamespace,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodSucceeded,
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   corev1.PodScheduled,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+
+	// Running pod with PodScheduled=True should be counted as scheduled
+	runningPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "running-pod",
+			Namespace: testPodNamespace,
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   corev1.PodScheduled,
+					Status: corev1.ConditionTrue,
+				},
+				{
+					Type:   corev1.PodReady,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+
+	pods := []*corev1.Pod{failedPod, succeededPod, runningPod}
+	categories := CategorizePodsByConditionType(logr.Discard(), pods)
+
+	// Only the running pod should be counted as scheduled
+	assert.Len(t, categories[corev1.PodScheduled], 1, "only non-terminal pods should be counted as scheduled")
+	assert.Equal(t, "running-pod", categories[corev1.PodScheduled][0].Name)
+
+	// The running pod should also be counted as ready
+	assert.Len(t, categories[corev1.PodReady], 1)
+	assert.Equal(t, "running-pod", categories[corev1.PodReady][0].Name)
+}

@@ -588,6 +588,86 @@ func TestComputeMinAvailableBreachedConditionPartialScheduleRegression(t *testin
 	}
 }
 
+// TestComputeMinAvailableBreachedCondition_TerminalPods verifies that terminal pods
+// (Failed or Succeeded phase) do not count as scheduled/available for minAvailable purposes.
+// This is a regression test for https://github.com/ai-dynamo/grove/issues/870
+func TestComputeMinAvailableBreachedCondition_TerminalPods(t *testing.T) {
+	tests := []struct {
+		name                                                string
+		pclq                                                *grovecorev1alpha1.PodClique
+		numPodsHavingAtleastOneContainerWithNonZeroExitCode int
+		numPodsStartedButNotReady                           int
+		wantStatus                                          metav1.ConditionStatus
+		wantReason                                          string
+	}{
+		{
+			name: "terminal pods do not count toward minAvailable - breach occurs",
+			pclq: &grovecorev1alpha1.PodClique{
+				Spec: grovecorev1alpha1.PodCliqueSpec{
+					Replicas:     2,
+					MinAvailable: ptr.To(int32(2)),
+				},
+				Status: grovecorev1alpha1.PodCliqueStatus{
+					ObservedGeneration: ptr.To(int64(1)),
+					Replicas:           2,
+					// Terminal pods are not counted as scheduled, so scheduledReplicas=0
+					ScheduledReplicas: 0,
+					ReadyReplicas:     0,
+				},
+			},
+			wantStatus: metav1.ConditionTrue,
+			wantReason: constants.ConditionReasonScheduledReplicasBelowMinAvailable,
+		},
+		{
+			name: "mix of running and terminal pods - only running counts",
+			pclq: &grovecorev1alpha1.PodClique{
+				Spec: grovecorev1alpha1.PodCliqueSpec{
+					Replicas:     3,
+					MinAvailable: ptr.To(int32(2)),
+				},
+				Status: grovecorev1alpha1.PodCliqueStatus{
+					ObservedGeneration: ptr.To(int64(1)),
+					Replicas:           3,
+					// Only 1 running pod scheduled (2 terminal pods not counted)
+					ScheduledReplicas: 1,
+					ReadyReplicas:     1,
+				},
+			},
+			wantStatus: metav1.ConditionTrue,
+			wantReason: constants.ConditionReasonScheduledReplicasBelowMinAvailable,
+		},
+		{
+			name: "sufficient non-terminal pods meet minAvailable",
+			pclq: &grovecorev1alpha1.PodClique{
+				Spec: grovecorev1alpha1.PodCliqueSpec{
+					Replicas:     3,
+					MinAvailable: ptr.To(int32(2)),
+				},
+				Status: grovecorev1alpha1.PodCliqueStatus{
+					ObservedGeneration: ptr.To(int64(1)),
+					Replicas:           3,
+					// 2 running pods scheduled (1 terminal pod not counted)
+					ScheduledReplicas: 2,
+					ReadyReplicas:     2,
+				},
+			},
+			wantStatus: metav1.ConditionFalse,
+			wantReason: constants.ConditionReasonSufficientReadyPods,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			condition := computeMinAvailableBreachedCondition(tt.pclq,
+				tt.numPodsHavingAtleastOneContainerWithNonZeroExitCode,
+				tt.numPodsStartedButNotReady)
+			assert.Equal(t, constants.ConditionTypeMinAvailableBreached, condition.Type)
+			assert.Equal(t, tt.wantStatus, condition.Status, "MinAvailableBreached status mismatch")
+			assert.Equal(t, tt.wantReason, condition.Reason, "MinAvailableBreached reason mismatch")
+		})
+	}
+}
+
 // TestReconcileStatusRequeuesOnConflict verifies that when the optimistic-locked status patch is
 // rejected with a conflict, reconcileStatus requeues after ComponentSyncRetryInterval instead of
 // surfacing a hard error. A conflict means the PodClique was written by a concurrent reconcile

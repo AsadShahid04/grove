@@ -48,7 +48,9 @@ func CategorizePodsByConditionType(logger logr.Logger, pods []*corev1.Pod) map[c
 	podCategories := make(map[corev1.PodConditionType][]*corev1.Pod)
 	for _, pod := range pods {
 		// Check if the pod has been scheduled or is schedule gated.
-		if IsPodScheduled(pod) {
+		// Terminal pods (Failed/Succeeded) should not count as scheduled for availability purposes,
+		// even though their PodScheduled condition may be True.
+		if IsPodScheduled(pod) && !IsPodTerminal(pod) {
 			podCategories[corev1.PodScheduled] = append(podCategories[corev1.PodScheduled], pod)
 		} else if IsPodScheduleGated(pod) {
 			podCategories[ScheduleGatedPod] = append(podCategories[ScheduleGatedPod], pod)
@@ -191,4 +193,11 @@ func IsPodReady(pod *corev1.Pod) bool {
 // IsPodPending checks if the Pod is pending, which indicates that the pod has not yet been scheduled.
 func IsPodPending(pod *corev1.Pod) bool {
 	return pod.Status.Phase == corev1.PodPending
+}
+
+// IsPodTerminal checks if the Pod has reached a terminal phase (Succeeded or Failed).
+// Terminal pods should not count toward availability and their indices should not be reused
+// until the pod object is fully deleted.
+func IsPodTerminal(pod *corev1.Pod) bool {
+	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
 }

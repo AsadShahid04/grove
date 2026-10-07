@@ -612,3 +612,173 @@ func scaleOutEntry(epoch, dependsOnEpoch string) grovecorev1alpha1.PodGangEntry 
 		WithDependsOn(dependsOnEpoch).
 		Build()
 }
+
+// TestDeleteTerminalPods verifies that pods in Failed or Succeeded phases are deleted
+// so they can be replaced. This is a regression test for https://github.com/ai-dynamo/grove/issues/870
+func TestDeleteTerminalPods(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, grovecorev1alpha1.AddToScheme(scheme))
+
+	pclq := &grovecorev1alpha1.PodClique{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pclq",
+			Namespace: testNamespace,
+		},
+	}
+
+	tests := []struct {
+		name                string
+		existingPods        []*corev1.Pod
+		expectedDeletedPods []string
+		expectRequeue       bool
+	}{
+		{
+			name: "deletes failed pod",
+			existingPods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "failed-pod",
+						Namespace: testNamespace,
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodFailed,
+					},
+				},
+			},
+			expectedDeletedPods: []string{"failed-pod"},
+			expectRequeue:       true,
+		},
+		{
+			name: "deletes succeeded pod",
+			existingPods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "succeeded-pod",
+						Namespace: testNamespace,
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodSucceeded,
+					},
+				},
+			},
+			expectedDeletedPods: []string{"succeeded-pod"},
+			expectRequeue:       true,
+		},
+		{
+			name: "deletes multiple terminal pods",
+			existingPods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "failed-pod-1",
+						Namespace: testNamespace,
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodFailed,
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "succeeded-pod-1",
+						Namespace: testNamespace,
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodSucceeded,
+					},
+				},
+			},
+			expectedDeletedPods: []string{"failed-pod-1", "succeeded-pod-1"},
+			expectRequeue:       true,
+		},
+		{
+			name: "does not delete running pods",
+			existingPods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "running-pod",
+						Namespace: testNamespace,
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodRunning,
+					},
+				},
+			},
+			expectedDeletedPods: []string{},
+			expectRequeue:       false,
+		},
+		{
+			name: "mixed running and terminal pods - only deletes terminal pods",
+			existingPods: []*corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "running-pod",
+						Namespace: testNamespace,
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodRunning,
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "failed-pod",
+						Namespace: testNamespace,
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodFailed,
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pending-pod",
+						Namespace: testNamespace,
+					},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodPending,
+					},
+				},
+			},
+			expectedDeletedPods: []string{"failed-pod"},
+			expectRequeue:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pclq).Build()
+			for _, pod := range tt.existingPods {
+				require.NoError(t, cl.Create(context.Background(), pod))
+			}
+
+			r := _resource{client: cl}
+			ss := &syncSnapshot{
+				pclq:             pclq,
+				existingPCLQPods: tt.existingPods,
+			}
+
+			err := r.deleteTerminalPods(context.Background(), logr.Discard(), ss)
+
+			if tt.expectRequeue {
+				require.Error(t, err, "deleteTerminalPods should requeue after deletion")
+			} else {
+				require.NoError(t, err, "deleteTerminalPods should not error when no pods to delete")
+			}
+
+			// Verify expected pods were deleted
+			for _, expectedDeleted := range tt.expectedDeletedPods {
+				pod := &corev1.Pod{}
+				err := cl.Get(context.Background(), client.ObjectKey{Name: expectedDeleted, Namespace: testNamespace}, pod)
+				assert.True(t, client.IgnoreNotFound(err) == nil && err != nil,
+					"pod %s should have been deleted", expectedDeleted)
+			}
+
+			// Verify other pods still exist
+			for _, pod := range tt.existingPods {
+				if !slices.Contains(tt.expectedDeletedPods, pod.Name) {
+					p := &corev1.Pod{}
+					err := cl.Get(context.Background(), client.ObjectKeyFromObject(pod), p)
+					assert.NoError(t, err, "pod %s should still exist", pod.Name)
+				}
+			}
+		})
+	}
+}
