@@ -18,15 +18,14 @@ import (
 	"context"
 	"fmt"
 	"slices"
-	"strconv"
 
 	apicommon "github.com/ai-dynamo/grove/operator/api/common"
 	"github.com/ai-dynamo/grove/operator/api/common/constants"
 	grovecorev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
 	internalconstants "github.com/ai-dynamo/grove/operator/internal/constants"
 	ctrlcommon "github.com/ai-dynamo/grove/operator/internal/controller/common"
-	componentutils "github.com/ai-dynamo/grove/operator/internal/controller/common/component/utils"
 	ctrlutils "github.com/ai-dynamo/grove/operator/internal/controller/utils"
+	componentutils "github.com/ai-dynamo/grove/operator/internal/utils/component"
 	k8sutils "github.com/ai-dynamo/grove/operator/internal/utils/kubernetes"
 
 	"github.com/go-logr/logr"
@@ -75,6 +74,11 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, logger logr.Logger, pc
 	pclqsPerPCSGReplica = pruneStrayPCSGPCLQs(pcsg, pclqsPerPCSGReplica)
 	mutateReplicas(logger, pcs, pcsg, pclqsPerPCSGReplica)
 	mutateMinAvailableBreachedCondition(logger, pcsg, pclqsPerPCSGReplica)
+	progressDeadline, err := progressDeadlineForPCSG(pcs, pcsg)
+	if err != nil {
+		logger.Error(err, "could not resolve ProgressDeadline for PodCliqueScalingGroup, proceeding without a deadline")
+	}
+	mutateUpdateInProgressCondition(pcsg, originalStatus, progressDeadline)
 	r.emitAllScheduledReplicasLostIfNeeded(pcsg, originalStatus.ScheduledReplicas)
 
 	if err = mutateSelector(pcs, pcsg); err != nil {
@@ -104,16 +108,15 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, logger logr.Logger, pc
 // It also derives child-PCLQ update progress counts when an update is in flight. The iteration is bounded to
 // expected replica indexes [0, Spec.Replicas) — the caller has already pruned stray children — so counters stay
 // consistent with the spec-derived totals during scale-down.
-func mutateReplicas(logger logr.Logger, pcs *grovecorev1alpha1.PodCliqueSet, pcsg *grovecorev1alpha1.PodCliqueScalingGroup, pclqsPerPCSGReplica map[string][]grovecorev1alpha1.PodClique) {
+func mutateReplicas(logger logr.Logger, pcs *grovecorev1alpha1.PodCliqueSet, pcsg *grovecorev1alpha1.PodCliqueScalingGroup, pclqsPerPCSGReplica map[int][]grovecorev1alpha1.PodClique) {
 	pcsg.Status.Replicas = pcsg.Spec.Replicas
 	var scheduledReplicas, availableReplicas, updatedReplicas, updatedPCLQs, totalPCLQs int32
 	cliqueNamesPerReplica := int32(len(pcsg.Spec.CliqueNames))
 	currentPCSGenerationHash := pcs.Status.CurrentGenerationHash
 	expectedPCLQPodTemplateHashes := componentutils.GetPCLQTemplateHashes(pcs, pcsg)
 	for replicaIndex := 0; replicaIndex < int(pcsg.Spec.Replicas); replicaIndex++ {
-		pcsgReplicaIndex := strconv.Itoa(replicaIndex)
-		pclqs := pclqsPerPCSGReplica[pcsgReplicaIndex]
-		isScheduled, isAvailable, isUpdated := computeReplicaStatus(logger, currentPCSGenerationHash, expectedPCLQPodTemplateHashes, pcsgReplicaIndex, len(pcsg.Spec.CliqueNames), pclqs)
+		pclqs := pclqsPerPCSGReplica[replicaIndex]
+		isScheduled, isAvailable, isUpdated := computeReplicaStatus(logger, currentPCSGenerationHash, expectedPCLQPodTemplateHashes, replicaIndex, len(pcsg.Spec.CliqueNames), pclqs)
 		if isScheduled {
 			scheduledReplicas++
 		}
@@ -126,7 +129,7 @@ func mutateReplicas(logger logr.Logger, pcs *grovecorev1alpha1.PodCliqueSet, pcs
 		updatedPCLQs += countPCSGReplicaUpdatedPCLQs(currentPCSGenerationHash, expectedPCLQPodTemplateHashes, pclqs)
 	}
 	totalPCLQs = pcsg.Spec.Replicas * cliqueNamesPerReplica
-	logger.Info("Mutating PodCliqueScalingGroup replicas",
+	logger.V(1).Info("Mutating PodCliqueScalingGroup replicas",
 		"pcsg", client.ObjectKeyFromObject(pcsg),
 		"scheduledReplicas", scheduledReplicas, "availableReplicas", availableReplicas, "updatedReplicas", updatedReplicas,
 		"updatedPCLQs", updatedPCLQs, "totalPCLQs", totalPCLQs)
@@ -159,7 +162,7 @@ func countPCSGReplicaUpdatedPCLQs(pcsGenerationHash *string, expectedPCLQPodTemp
 }
 
 // computeReplicaStatus processes a single PodCliqueScalingGroup replica and returns whether it is scheduled and available.
-func computeReplicaStatus(logger logr.Logger, currentPCSGenerationHash *string, expectedPCLQPodTemplateHashes map[string]string, pcsgReplicaIndex string, numPCSGCliqueNames int, pclqs []grovecorev1alpha1.PodClique) (isScheduled, isAvailable, isUpdated bool) {
+func computeReplicaStatus(logger logr.Logger, currentPCSGenerationHash *string, expectedPCLQPodTemplateHashes map[string]string, pcsgReplicaIndex int, numPCSGCliqueNames int, pclqs []grovecorev1alpha1.PodClique) (isScheduled, isAvailable, isUpdated bool) {
 	nonTerminatedPCSGPodCliques := lo.Filter(pclqs, func(pclq grovecorev1alpha1.PodClique, _ int) bool {
 		return !k8sutils.IsResourceTerminating(pclq.ObjectMeta)
 	})
@@ -223,7 +226,7 @@ func (r *Reconciler) emitAllScheduledReplicasLostIfNeeded(pcsg *grovecorev1alpha
 // condition is present, the latter is removed. The flag is only ever set while the PCSG is in
 // breach, so the first False observed with the flag still set is the recovery; clearing it
 // re-arms the next breach episode so a fresh regression can be recycled.
-func mutateMinAvailableBreachedCondition(logger logr.Logger, pcsg *grovecorev1alpha1.PodCliqueScalingGroup, pclqsPerPCSGReplica map[string][]grovecorev1alpha1.PodClique) {
+func mutateMinAvailableBreachedCondition(logger logr.Logger, pcsg *grovecorev1alpha1.PodCliqueScalingGroup, pclqsPerPCSGReplica map[int][]grovecorev1alpha1.PodClique) {
 	newCondition := computeMinAvailableBreachedCondition(logger, pcsg, pclqsPerPCSGReplica)
 	if k8sutils.HasConditionChanged(pcsg.Status.Conditions, newCondition) {
 		logger.Info("Updating MinAvailableBreached condition for PodCliqueScalingGroup",
@@ -252,13 +255,25 @@ func mutateMinAvailableBreachedCondition(logger logr.Logger, pcsg *grovecorev1al
 //     handler reads to decide whether to restart the whole PCS replica.
 //
 // Rolling update short-circuits this to Unknown so gang termination doesn't fire mid-update.
-func computeMinAvailableBreachedCondition(logger logr.Logger, pcsg *grovecorev1alpha1.PodCliqueScalingGroup, pclqsPerPCSGReplica map[string][]grovecorev1alpha1.PodClique) metav1.Condition {
+func computeMinAvailableBreachedCondition(logger logr.Logger, pcsg *grovecorev1alpha1.PodCliqueScalingGroup, pclqsPerPCSGReplica map[int][]grovecorev1alpha1.PodClique) metav1.Condition {
 	if componentutils.IsPCSGUpdateInProgress(pcsg) {
 		return metav1.Condition{
 			Type:    constants.ConditionTypeMinAvailableBreached,
 			Status:  metav1.ConditionUnknown,
 			Reason:  constants.ConditionReasonUpdateInProgress,
 			Message: "Update is in progress",
+		}
+	}
+
+	// A PodCliqueScalingGroup intentionally scaled to zero has no replicas to keep available, so it is not
+	// in breach. A non-zero replica count below MinAvailable, or a loss of replicas below MinAvailable at
+	// an unchanged replica count, is still a breach.
+	if pcsg.Spec.Replicas == 0 {
+		return metav1.Condition{
+			Type:    constants.ConditionTypeMinAvailableBreached,
+			Status:  metav1.ConditionFalse,
+			Reason:  constants.ConditionReasonSufficientAvailablePCSGReplicas,
+			Message: "PodCliqueScalingGroup is scaled to zero, so MinAvailable is not breached",
 		}
 	}
 
@@ -302,11 +317,10 @@ func computeMinAvailableBreachedCondition(logger logr.Logger, pcsg *grovecorev1a
 //
 // Iteration is bounded to expected replica indexes [0, Spec.Replicas) so stale-index children left
 // behind during scale-down neither inflate nor deflate the count.
-func computeNotInBreachReplicas(logger logr.Logger, pcsg *grovecorev1alpha1.PodCliqueScalingGroup, pclqsPerPCSGReplica map[string][]grovecorev1alpha1.PodClique) int {
+func computeNotInBreachReplicas(logger logr.Logger, pcsg *grovecorev1alpha1.PodCliqueScalingGroup, pclqsPerPCSGReplica map[int][]grovecorev1alpha1.PodClique) int {
 	expectedPCLQsPerReplica := len(pcsg.Spec.CliqueNames)
 	var notInBreachReplicas int
-	for replicaIndex := 0; replicaIndex < int(pcsg.Spec.Replicas); replicaIndex++ {
-		pcsgReplicaIndex := strconv.Itoa(replicaIndex)
+	for pcsgReplicaIndex := 0; pcsgReplicaIndex < int(pcsg.Spec.Replicas); pcsgReplicaIndex++ {
 		nonTerminatingPCLQs := lo.Filter(pclqsPerPCSGReplica[pcsgReplicaIndex], func(pclq grovecorev1alpha1.PodClique, _ int) bool {
 			return !k8sutils.IsResourceTerminating(pclq.ObjectMeta)
 		})
@@ -329,7 +343,7 @@ func computeNotInBreachReplicas(logger logr.Logger, pcsg *grovecorev1alpha1.PodC
 }
 
 // getPodCliquesPerPCSGReplica retrieves and groups PodCliques by their PCSG replica index
-func (r *Reconciler) getPodCliquesPerPCSGReplica(ctx context.Context, pcsName string, pcsgObjKey client.ObjectKey) (map[string][]grovecorev1alpha1.PodClique, error) {
+func (r *Reconciler) getPodCliquesPerPCSGReplica(ctx context.Context, pcsName string, pcsgObjKey client.ObjectKey) (map[int][]grovecorev1alpha1.PodClique, error) {
 	selectorLabels := lo.Assign(
 		apicommon.GetDefaultLabelsForPodCliqueSetManagedResources(pcsName),
 		map[string]string{
@@ -346,8 +360,7 @@ func (r *Reconciler) getPodCliquesPerPCSGReplica(ctx context.Context, pcsName st
 	if err != nil {
 		return nil, err
 	}
-	pclqsPerPCSGReplica := componentutils.GroupPCLQsByPCSGReplicaIndex(pclqs)
-	return pclqsPerPCSGReplica, nil
+	return componentutils.GroupPCLQsByPCSGReplicaIndex(pclqs)
 }
 
 // mutateSelector publishes the label selector on the PodCliqueScalingGroup /scale subresource so
@@ -383,11 +396,11 @@ func mutateSelector(pcs *grovecorev1alpha1.PodCliqueSet, pcsg *grovecorev1alpha1
 func mutateCurrentPodCliqueSetGenerationHash(logger logr.Logger, pcs *grovecorev1alpha1.PodCliqueSet, pcsg *grovecorev1alpha1.PodCliqueScalingGroup, existingPCLQs []grovecorev1alpha1.PodClique) {
 	pclqFQNsPendingUpdate := componentutils.GetPCLQsInPCSGPendingUpdate(pcs, pcsg, existingPCLQs)
 	if len(pclqFQNsPendingUpdate) > 0 {
-		logger.Info("Found PodCliques associated to PodCliqueScalingGroup pending update", "pclqFQNsPendingUpdate", pclqFQNsPendingUpdate)
+		logger.V(1).Info("Found PodCliques associated to PodCliqueScalingGroup pending update", "pclqFQNsPendingUpdate", pclqFQNsPendingUpdate)
 		return
 	}
 	if componentutils.IsPCSGUpdateInProgress(pcsg) {
-		logger.Info("PodCliqueScalingGroup is currently updating, cannot set PodCliqueSet CurrentGenerationHash yet")
+		logger.V(1).Info("PodCliqueScalingGroup is currently updating, cannot set PodCliqueSet CurrentGenerationHash yet")
 		return
 	}
 	if pcs.Status.CurrentGenerationHash == nil {
@@ -435,18 +448,17 @@ func havePCSGPodCliquesConverged(pcs *grovecorev1alpha1.PodCliqueSet, pcsg *grov
 // is not produced by Spec.CliqueNames at the kept indexes — strays left behind by scale-down or a
 // clique-name change that would otherwise inflate replica/progress counters past the spec-derived
 // totals. Mutates the input map in place (caller holds the only reference, fresh from grouping).
-func pruneStrayPCSGPCLQs(pcsg *grovecorev1alpha1.PodCliqueScalingGroup, pclqsPerPCSGReplica map[string][]grovecorev1alpha1.PodClique) map[string][]grovecorev1alpha1.PodClique {
+func pruneStrayPCSGPCLQs(pcsg *grovecorev1alpha1.PodCliqueScalingGroup, pclqsPerPCSGReplica map[int][]grovecorev1alpha1.PodClique) map[int][]grovecorev1alpha1.PodClique {
 	expectedReplicas := int(pcsg.Spec.Replicas)
 	expectedFQNs := make(map[string]struct{}, expectedReplicas*len(pcsg.Spec.CliqueNames))
-	for replicaIndex := 0; replicaIndex < expectedReplicas; replicaIndex++ {
+	for replicaIndex := range expectedReplicas {
 		for _, cliqueName := range pcsg.Spec.CliqueNames {
 			expectedFQNs[apicommon.GeneratePodCliqueName(apicommon.ResourceNameReplica{Name: pcsg.Name, Replica: replicaIndex}, cliqueName)] = struct{}{}
 		}
 	}
-	for key, pclqs := range pclqsPerPCSGReplica {
-		idx, err := strconv.Atoi(key)
-		if err != nil || idx < 0 || idx >= expectedReplicas {
-			delete(pclqsPerPCSGReplica, key)
+	for pcsgReplicaIndex, pclqs := range pclqsPerPCSGReplica {
+		if pcsgReplicaIndex < 0 || pcsgReplicaIndex >= expectedReplicas {
+			delete(pclqsPerPCSGReplica, pcsgReplicaIndex)
 			continue
 		}
 		kept := slices.DeleteFunc(pclqs, func(p grovecorev1alpha1.PodClique) bool {
@@ -454,10 +466,82 @@ func pruneStrayPCSGPCLQs(pcsg *grovecorev1alpha1.PodCliqueScalingGroup, pclqsPer
 			return !ok
 		})
 		if len(kept) == 0 {
-			delete(pclqsPerPCSGReplica, key)
+			delete(pclqsPerPCSGReplica, pcsgReplicaIndex)
 			continue
 		}
-		pclqsPerPCSGReplica[key] = kept
+		pclqsPerPCSGReplica[pcsgReplicaIndex] = kept
 	}
 	return pclqsPerPCSGReplica
+}
+
+// progressDeadlineForPCSG resolves the ProgressDeadline for the PodCliqueScalingGroup from its
+// PodCliqueSet config. It is nil when no ProgressDeadline is configured.
+func progressDeadlineForPCSG(pcs *grovecorev1alpha1.PodCliqueSet, pcsg *grovecorev1alpha1.PodCliqueScalingGroup) (*metav1.Duration, error) {
+	pcsReplicaIndex, err := k8sutils.GetPodCliqueSetReplicaIndex(pcsg.ObjectMeta)
+	if err != nil {
+		return nil, err
+	}
+	pcsgConfig, ok := lo.Find(pcs.Spec.Template.PodCliqueScalingGroupConfigs, func(cfg grovecorev1alpha1.PodCliqueScalingGroupConfig) bool {
+		return apicommon.GeneratePodCliqueScalingGroupName(apicommon.ResourceNameReplica{Name: pcs.Name, Replica: pcsReplicaIndex}, cfg.Name) == pcsg.Name
+	})
+	if !ok || pcsgConfig.RollingUpdate == nil {
+		return nil, nil
+	}
+	return pcsgConfig.RollingUpdate.ProgressDeadline, nil
+}
+
+// isPCSGRollingUpdateInProgress reports whether the PodCliqueScalingGroup is under a rolling update.
+func isPCSGRollingUpdateInProgress(pcsg *grovecorev1alpha1.PodCliqueScalingGroup) bool {
+	return pcsg.Status.UpdateProgress != nil && pcsg.Status.UpdateProgress.UpdateEndedAt == nil
+}
+
+// mutateUpdateInProgressCondition maintains LastProgressedAt and sets the UpdateInProgress
+// condition. While a rolling update is in progress LastProgressedAt starts on the first reconcile and advances
+// whenever UpdatedReplicas increases, and the condition is True (Progressing) or Unknown
+// (ProgressDeadlineExceeded) when no progress has been made within ProgressDeadline. Otherwise, the
+// LastProgressedAt is cleared and the condition is False (NoActiveUpdate).
+func mutateUpdateInProgressCondition(pcsg *grovecorev1alpha1.PodCliqueScalingGroup, originalStatus *grovecorev1alpha1.PodCliqueScalingGroupStatus, progressDeadline *metav1.Duration) {
+	now := metav1.Now()
+	if isPCSGRollingUpdateInProgress(pcsg) {
+		if pcsg.Status.UpdateProgress.LastProgressedAt == nil || pcsg.Status.UpdatedReplicas > originalStatus.UpdatedReplicas {
+			pcsg.Status.UpdateProgress.LastProgressedAt = &now
+		}
+	} else if pcsg.Status.UpdateProgress != nil {
+		pcsg.Status.UpdateProgress.LastProgressedAt = nil
+	}
+
+	newCondition := computeUpdateInProgressCondition(pcsg, progressDeadline, now)
+	if k8sutils.HasConditionChanged(pcsg.Status.Conditions, newCondition) {
+		meta.SetStatusCondition(&pcsg.Status.Conditions, newCondition)
+	}
+}
+
+// computeUpdateInProgressCondition returns the UpdateInProgress condition for the PodCliqueScalingGroup
+// based on whether a rolling update is in progress and whether it has progressed within ProgressDeadline.
+func computeUpdateInProgressCondition(pcsg *grovecorev1alpha1.PodCliqueScalingGroup, progressDeadline *metav1.Duration, now metav1.Time) metav1.Condition {
+	if !isPCSGRollingUpdateInProgress(pcsg) {
+		return metav1.Condition{
+			Type:               constants.ConditionTypeUpdateInProgress,
+			Status:             metav1.ConditionFalse,
+			Reason:             constants.ConditionReasonNoActiveUpdate,
+			Message:            "No rolling update is in progress",
+			LastTransitionTime: now,
+		}
+	}
+	if progressDeadline != nil && now.Sub(pcsg.Status.UpdateProgress.LastProgressedAt.Time) > progressDeadline.Duration {
+		return metav1.Condition{
+			Type:               constants.ConditionTypeUpdateInProgress,
+			Status:             metav1.ConditionUnknown,
+			Reason:             constants.ConditionReasonProgressDeadlineExceeded,
+			Message:            fmt.Sprintf("Rolling update has not progressed within the progress deadline of %s", progressDeadline.Duration),
+			LastTransitionTime: now,
+		}
+	}
+	return metav1.Condition{
+		Type:               constants.ConditionTypeUpdateInProgress,
+		Status:             metav1.ConditionTrue,
+		Reason:             constants.ConditionReasonProgressing,
+		Message:            "Rolling update is in progress",
+		LastTransitionTime: now,
+	}
 }
