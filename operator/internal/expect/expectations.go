@@ -55,6 +55,9 @@ type ControlleeExpectations struct {
 	uidsToDelete sets.Set[types.UID]
 	// uidsToAdd are the set of resource UIDs that are expected to be created.
 	uidsToAdd sets.Set[types.UID]
+	// creationIndices maps UID to the index (e.g. hostname index) assigned to that creation. Optional; only set when
+	// ExpectCreationsWithIndex is used so that callers can reserve those indices until the creation is observed.
+	creationIndices map[types.UID]int
 }
 
 // Key returns the storage key this expectation is recorded under. It is the same key
@@ -77,11 +80,18 @@ func (e *ControlleeExpectations) Key() string {
 // deepCopy returns a copy of the expectations with cloned UID sets, so callers can read the returned
 // value without holding the store lock and cannot mutate the store's live sets.
 func (e *ControlleeExpectations) deepCopy() *ControlleeExpectations {
-	return &ControlleeExpectations{
+	cp := &ControlleeExpectations{
 		key:          e.key,
 		uidsToDelete: e.uidsToDelete.Clone(),
 		uidsToAdd:    e.uidsToAdd.Clone(),
 	}
+	if e.creationIndices != nil {
+		cp.creationIndices = make(map[types.UID]int, len(e.creationIndices))
+		for uid, idx := range e.creationIndices {
+			cp.creationIndices[uid] = idx
+		}
+	}
+	return cp
 }
 
 // NewExpectationsStore creates a new expectations store.
@@ -93,12 +103,19 @@ func NewExpectationsStore() *ExpectationsStore {
 
 // ExpectCreations records resource creation expectations for uids for a controlled resource identified by a controlleeKey.
 func (s *ExpectationsStore) ExpectCreations(logger logr.Logger, controlleeKey string, uids ...types.UID) error {
-	return s.createOrRaiseExpectations(logger, controlleeKey, uids, nil)
+	return s.createOrRaiseExpectations(logger, controlleeKey, uids, nil, nil)
+}
+
+// ExpectCreationsWithIndex records a creation expectation with the given index (e.g. hostname index) so that
+// GetCreateExpectationIndices can return it. Call this when the created resource is assigned a specific index
+// that must be reserved until the creation is observed (e.g. to avoid assigning the same index to another resource).
+func (s *ExpectationsStore) ExpectCreationsWithIndex(logger logr.Logger, controlleeKey string, uid types.UID, index int) error {
+	return s.createOrRaiseExpectations(logger, controlleeKey, []types.UID{uid}, nil, map[types.UID]int{uid: index})
 }
 
 // ExpectDeletions records resource deletion expectations for uids for a controlled resource identified by a controlleeKey.
 func (s *ExpectationsStore) ExpectDeletions(logger logr.Logger, controlleeKey string, uids ...types.UID) error {
-	return s.createOrRaiseExpectations(logger, controlleeKey, nil, uids)
+	return s.createOrRaiseExpectations(logger, controlleeKey, nil, uids, nil)
 }
 
 // ObserveDeletions lowers the delete expectations removing the uids passed.
@@ -176,6 +193,9 @@ func (s *ExpectationsStore) SyncExpectations(controlleeKey string, existingNonTe
 		// Remove the UIDs from `uidsToAdd` if the informer cache is already up-to-date and certain events have
 		// been missed/dropped by the watch resulting in missed calls to `CreationObserved`.
 		exp.uidsToAdd.Delete(existingNonTerminatingUIDs...)
+		for _, uid := range existingNonTerminatingUIDs {
+			delete(exp.creationIndices, uid)
+		}
 		// Remove stale entries in `uidsToDelete` if the `existingUIDS` no longer has those UIDs.
 		staleUIDs := exp.uidsToDelete.Difference(sets.New(existingNonTerminatingUIDs...))
 		exp.uidsToDelete.Delete(staleUIDs.UnsortedList()...)
@@ -197,6 +217,24 @@ func (s *ExpectationsStore) GetCreateExpectations(controlleeKey string) []types.
 		return exp.uidsToAdd.UnsortedList()
 	}
 	return nil
+}
+
+// GetCreateExpectationIndices returns the set of indices (e.g. hostname indices) for creations that have not yet been
+// synced, when those were recorded via ExpectCreationsWithIndex. Returns nil if none or if no indices were recorded.
+func (s *ExpectationsStore) GetCreateExpectationIndices(controlleeKey string) []int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	exp, exists, _ := s.getExpectations(controlleeKey)
+	if !exists || exp.creationIndices == nil {
+		return nil
+	}
+	var out []int
+	for uid := range exp.uidsToAdd {
+		if idx, ok := exp.creationIndices[uid]; ok {
+			out = append(out, idx)
+		}
+	}
+	return out
 }
 
 // GetDeleteExpectations is a convenience method which gives a slice of resource UIDs for which deletion has not yet been synced
@@ -221,7 +259,9 @@ func (s *ExpectationsStore) HasDeleteExpectation(controlleeKey string, uid types
 }
 
 // createOrRaiseExpectations creates or raises create/delete expectations for the given controlleeKey.
-func (s *ExpectationsStore) createOrRaiseExpectations(logger logr.Logger, controlleeKey string, uidsToAdd, uidsToDelete []types.UID) error {
+// creationIndexByUID is optional: when non-nil, each uid in uidsToAdd that has an entry will have that index stored
+// for GetCreateExpectationIndices (e.g. hostname index to reserve until the creation is observed).
+func (s *ExpectationsStore) createOrRaiseExpectations(logger logr.Logger, controlleeKey string, uidsToAdd, uidsToDelete []types.UID, creationIndexByUID map[types.UID]int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	exp, exists, err := s.getExpectations(controlleeKey)
@@ -234,12 +274,33 @@ func (s *ExpectationsStore) createOrRaiseExpectations(logger logr.Logger, contro
 			uidsToAdd:    sets.New(uidsToAdd...),
 			uidsToDelete: sets.New(uidsToDelete...),
 		}
+		if len(creationIndexByUID) > 0 {
+			exp.creationIndices = make(map[types.UID]int)
+			for _, uid := range uidsToAdd {
+				if idx, ok := creationIndexByUID[uid]; ok {
+					exp.creationIndices[uid] = idx
+				}
+			}
+		}
 		logger.Info("created expectations for controller resource", "controlleeKey", controlleeKey, "uidsToAdd", uidsToAdd, "uidsToDelete", uidsToDelete)
 	} else {
 		exp.uidsToAdd.Insert(uidsToAdd...)
+		if len(creationIndexByUID) > 0 {
+			if exp.creationIndices == nil {
+				exp.creationIndices = make(map[types.UID]int)
+			}
+			for _, uid := range uidsToAdd {
+				if idx, ok := creationIndexByUID[uid]; ok {
+					exp.creationIndices[uid] = idx
+				}
+			}
+		}
 		// If there are UIDs in uidsToDelete that also have a presence in uidsToAdd then remove these UIDs from uidsToAdd
 		// as those add expectations are now no longer valid.
 		exp.uidsToAdd.Delete(uidsToDelete...)
+		for _, uid := range uidsToDelete {
+			delete(exp.creationIndices, uid)
+		}
 		exp.uidsToDelete.Insert(uidsToDelete...)
 		logger.Info("raised expectations for controller resource", "controlleeKey", controlleeKey, "uidsToAdd", uidsToAdd, "uidsToDelete", uidsToDelete)
 	}
@@ -253,6 +314,9 @@ func (s *ExpectationsStore) lowerExpectations(logger logr.Logger, controlleeKey 
 	if exp, exists, _ := s.getExpectations(controlleeKey); exists {
 		exp.uidsToAdd.Delete(addUIDs...)
 		exp.uidsToAdd.Delete(deleteUIDs...)
+		for _, uid := range addUIDs {
+			delete(exp.creationIndices, uid)
+		}
 		exp.uidsToDelete.Delete(deleteUIDs...)
 		logger.Info("lowered expectations for controlled resource", "controlleeKey", controlleeKey, "addUIDs", addUIDs, "deleteUIDs", deleteUIDs)
 	}

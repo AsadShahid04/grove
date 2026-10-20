@@ -323,3 +323,202 @@ func initializeControlleeExpectations(expStore *ExpectationsStore, controlleeKey
 		uidsToDelete: sets.New(uidsToDelete...),
 	})
 }
+
+// ==================== Index Tracking Tests ====================
+
+func TestExpectCreationsWithIndex(t *testing.T) {
+	expStore := NewExpectationsStore()
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, types.UID("uid-1"), 2))
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, types.UID("uid-2"), 3))
+
+	assert.ElementsMatch(t, []types.UID{"uid-1", "uid-2"}, expStore.GetCreateExpectations(controlleeKey))
+	indices := expStore.GetCreateExpectationIndices(controlleeKey)
+	assert.Len(t, indices, 2)
+	assert.ElementsMatch(t, []int{2, 3}, indices)
+}
+
+func TestGetCreateExpectationIndices_AfterSync(t *testing.T) {
+	expStore := NewExpectationsStore()
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, types.UID("uid-1"), 2))
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, types.UID("uid-2"), 3))
+
+	// After sync (observe uid-1), only uid-2's index remains reserved
+	expStore.SyncExpectations(controlleeKey, []types.UID{"uid-1"}, nil)
+	assert.ElementsMatch(t, []int{3}, expStore.GetCreateExpectationIndices(controlleeKey))
+}
+
+func TestGetCreateExpectationIndices_NilIndices(t *testing.T) {
+	// When expectations exist but no indices were recorded (e.g. via initializeControlleeExpectations),
+	// GetCreateExpectationIndices should return nil.
+	expStore := NewExpectationsStore()
+	assert.NoError(t, initializeControlleeExpectations(expStore, controlleeKey, []types.UID{"uid-1", "uid-2"}, nil))
+
+	indices := expStore.GetCreateExpectationIndices(controlleeKey)
+	assert.Nil(t, indices)
+}
+
+func TestGetCreateExpectationIndices_NoExpectations(t *testing.T) {
+	expStore := NewExpectationsStore()
+	indices := expStore.GetCreateExpectationIndices("nonexistent-key")
+	assert.Nil(t, indices)
+}
+
+func TestLowerExpectations_CleansCreationIndices(t *testing.T) {
+	expStore := NewExpectationsStore()
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, types.UID("uid-1"), 10))
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, types.UID("uid-2"), 20))
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, types.UID("uid-3"), 30))
+
+	// Verify all 3 indices are present
+	assert.ElementsMatch(t, []int{10, 20, 30}, expStore.GetCreateExpectationIndices(controlleeKey))
+
+	// Sync with uid-1 observed (it appears in non-terminating UIDs)
+	expStore.SyncExpectations(controlleeKey, []types.UID{"uid-1"}, nil)
+
+	// uid-1's index (10) should be gone
+	assert.ElementsMatch(t, []int{20, 30}, expStore.GetCreateExpectationIndices(controlleeKey))
+	assert.ElementsMatch(t, []types.UID{"uid-2", "uid-3"}, expStore.GetCreateExpectations(controlleeKey))
+}
+
+func TestExpectCreationsWithIndex_OverwriteIndex(t *testing.T) {
+	// If the same UID is registered again with a different index, the new index should overwrite.
+	expStore := NewExpectationsStore()
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, types.UID("uid-1"), 5))
+	assert.ElementsMatch(t, []int{5}, expStore.GetCreateExpectationIndices(controlleeKey))
+
+	// Re-register same UID with different index
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, types.UID("uid-1"), 99))
+	indices := expStore.GetCreateExpectationIndices(controlleeKey)
+	assert.Len(t, indices, 1)
+	assert.Equal(t, 99, indices[0])
+}
+
+func TestExpectCreationsAndDeletions_Interleaved(t *testing.T) {
+	// Test the scenario where a UID is added and then deleted in the same expectations set.
+	// The delete should remove the UID from uidsToAdd and clean up its creationIndex.
+	expStore := NewExpectationsStore()
+
+	// Create expectations with indices
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, types.UID("uid-1"), 10))
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, types.UID("uid-2"), 20))
+
+	// Now expect deletion of uid-1 (this removes uid-1 from uidsToAdd)
+	assert.NoError(t, expStore.ExpectDeletions(logr.Discard(), controlleeKey, types.UID("uid-1")))
+
+	// uid-1 should be removed from create expectations and its index cleaned up
+	assert.ElementsMatch(t, []types.UID{"uid-2"}, expStore.GetCreateExpectations(controlleeKey))
+	assert.ElementsMatch(t, []int{20}, expStore.GetCreateExpectationIndices(controlleeKey))
+}
+
+func TestFullLifecycle_CreateExpectation_GetIndices_Observe_Cleanup(t *testing.T) {
+	expStore := NewExpectationsStore()
+
+	// Step 1: Reconciler creates 3 pods with indices 0, 1, 2
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, types.UID("pod-uid-a"), 0))
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, types.UID("pod-uid-b"), 1))
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, types.UID("pod-uid-c"), 2))
+
+	// Step 2: Next reconcile starts, informer cache has pod-uid-a but not b and c yet
+	// GetCreateExpectationIndices should return all 3 indices as reserved
+	allIndices := expStore.GetCreateExpectationIndices(controlleeKey)
+	assert.Len(t, allIndices, 3)
+	assert.ElementsMatch(t, []int{0, 1, 2}, allIndices)
+
+	// Step 3: SyncExpectations sees pod-uid-a in cache
+	expStore.SyncExpectations(controlleeKey, []types.UID{"pod-uid-a"}, nil)
+
+	// Step 4: Now only indices 1, 2 should be reserved
+	reservedIndices := expStore.GetCreateExpectationIndices(controlleeKey)
+	assert.Len(t, reservedIndices, 2)
+	assert.ElementsMatch(t, []int{1, 2}, reservedIndices)
+
+	// Step 5: pod-uid-b and pod-uid-c appear in cache
+	expStore.SyncExpectations(controlleeKey, []types.UID{"pod-uid-b", "pod-uid-c"}, nil)
+
+	// Step 6: No more reserved indices
+	finalIndices := expStore.GetCreateExpectationIndices(controlleeKey)
+	assert.Nil(t, finalIndices)
+	assert.Empty(t, expStore.GetCreateExpectations(controlleeKey))
+}
+
+func TestConcurrentExpectCreationsWithIndex(t *testing.T) {
+	expStore := NewExpectationsStore()
+	const numGoroutines = 50
+
+	wg := sync.WaitGroup{}
+	wg.Add(numGoroutines)
+	for i := range numGoroutines {
+		go func(idx int) {
+			defer wg.Done()
+			uid := types.UID("uid-" + string(rune('0'+idx)))
+			_ = expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, uid, idx)
+		}(i)
+	}
+	wg.Wait()
+
+	// All 50 UIDs should be present
+	createExps := expStore.GetCreateExpectations(controlleeKey)
+	assert.Len(t, createExps, numGoroutines)
+
+	// All 50 indices should be present
+	indices := expStore.GetCreateExpectationIndices(controlleeKey)
+	assert.Len(t, indices, numGoroutines)
+}
+
+func TestSyncExpectations_WithCreationIndices(t *testing.T) {
+	expStore := NewExpectationsStore()
+	key := "test-ns/indices-sync"
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), key, types.UID("uid-1"), 10))
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), key, types.UID("uid-2"), 20))
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), key, types.UID("uid-3"), 30))
+
+	// Sync: uid-1 is now visible as non-terminating
+	expStore.SyncExpectations(key, []types.UID{"uid-1"}, nil)
+
+	// uid-1's index must be gone; uid-2, uid-3 still reserved
+	assert.ElementsMatch(t, []int{20, 30}, expStore.GetCreateExpectationIndices(key))
+	assert.ElementsMatch(t, []types.UID{"uid-2", "uid-3"}, expStore.GetCreateExpectations(key))
+}
+
+func TestDeleteExpectations_CleansIndices(t *testing.T) {
+	expStore := NewExpectationsStore()
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, types.UID("uid-1"), 5))
+	assert.NoError(t, expStore.ExpectCreationsWithIndex(logr.Discard(), controlleeKey, types.UID("uid-2"), 10))
+
+	// Delete all expectations
+	assert.NoError(t, expStore.DeleteExpectations(logr.Discard(), controlleeKey))
+
+	// Everything should be gone
+	assert.Nil(t, expStore.GetCreateExpectationIndices(controlleeKey))
+	assert.Nil(t, expStore.GetCreateExpectations(controlleeKey))
+}
+
+func TestDeepCopy_WithCreationIndices(t *testing.T) {
+	original := &ControlleeExpectations{
+		key:          "test-key",
+		uidsToAdd:    sets.New[types.UID]("uid-1", "uid-2"),
+		uidsToDelete: sets.New[types.UID]("uid-3"),
+		creationIndices: map[types.UID]int{
+			"uid-1": 10,
+			"uid-2": 20,
+		},
+	}
+
+	copied := original.deepCopy()
+
+	// Verify the copy has the same values
+	assert.Equal(t, original.key, copied.key)
+	assert.ElementsMatch(t, original.uidsToAdd.UnsortedList(), copied.uidsToAdd.UnsortedList())
+	assert.ElementsMatch(t, original.uidsToDelete.UnsortedList(), copied.uidsToDelete.UnsortedList())
+	assert.Equal(t, len(original.creationIndices), len(copied.creationIndices))
+	for uid, idx := range original.creationIndices {
+		assert.Equal(t, idx, copied.creationIndices[uid])
+	}
+
+	// Verify mutations to the copy don't affect the original
+	copied.uidsToAdd.Insert("uid-99")
+	copied.creationIndices["uid-99"] = 99
+
+	assert.False(t, original.uidsToAdd.Has("uid-99"))
+	assert.NotContains(t, original.creationIndices, types.UID("uid-99"))
+}
