@@ -27,6 +27,7 @@ import (
 	"github.com/ai-dynamo/grove/operator/internal/controller/common/component"
 	"github.com/ai-dynamo/grove/operator/internal/controller/podclique/expectations"
 	groveerr "github.com/ai-dynamo/grove/operator/internal/errors"
+	"github.com/ai-dynamo/grove/operator/internal/expect"
 	"github.com/ai-dynamo/grove/operator/internal/index"
 	"github.com/ai-dynamo/grove/operator/internal/scheduler"
 	"github.com/ai-dynamo/grove/operator/internal/utils"
@@ -39,6 +40,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -647,8 +650,17 @@ func removePodGangSchedulingGate(pod *corev1.Pod) bool {
 
 // createPods creates the specified number of new pods for the PodClique with proper indexing and concurrency control
 func (r _resource) createPods(ctx context.Context, logger logr.Logger, ss *syncSnapshot, numPods int) (int, error) {
+	// Collect reserved indices from in-flight creates not yet in the cache
+	reservedIndices, err := r.getReservedIndices(ss.pclq.ObjectMeta)
+	if err != nil {
+		return 0, groveerr.WrapError(err,
+			errCodeGetAvailablePodHostNameIndices,
+			component.OperationSync,
+			fmt.Sprintf("error collecting reserved indices for PodClique %v", client.ObjectKeyFromObject(ss.pclq)),
+		)
+	}
 	// Pre-calculate all needed indices to avoid race conditions
-	availableIndices, err := index.GetAvailableIndices(logger, ss.existingPCLQPods, numPods)
+	availableIndices, err := index.GetAvailableIndices(logger, ss.existingPCLQPods, reservedIndices, numPods)
 	if err != nil {
 		return 0, groveerr.WrapError(err,
 			errCodeGetAvailablePodHostNameIndices,
@@ -676,6 +688,26 @@ func (r _resource) createPods(ctx context.Context, logger logr.Logger, ss *syncS
 		return 0, err
 	}
 	return len(runResult.SuccessfulTasks), nil
+}
+
+// getReservedIndices collects the hostname indices of in-flight Pod creations (not yet in the cache)
+// across all PodGangs of the PodClique, so index allocation can reserve them.
+func (r _resource) getReservedIndices(pclqObjMeta metav1.ObjectMeta) (sets.Set[int], error) {
+	pclqKey, err := cache.MetaNamespaceKeyFunc(&grovecorev1alpha1.PodClique{ObjectMeta: pclqObjMeta})
+	if err != nil {
+		return nil, err
+	}
+	exps, err := r.expectationsStore.ByIndex(expectations.PodCliqueExpectationsIndexName, pclqKey)
+	if err != nil {
+		return nil, err
+	}
+	reserved := sets.New[int]()
+	for _, exp := range exps {
+		expKey := exp.(*expect.ControlleeExpectations).Key()
+		indices := r.expectationsStore.GetCreateExpectationIndices(expKey)
+		reserved.Insert(indices...)
+	}
+	return reserved, nil
 }
 
 // Convenience functions, types and methods on these types that are used during sync flow run.

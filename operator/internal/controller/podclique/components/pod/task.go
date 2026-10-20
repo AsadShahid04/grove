@@ -57,11 +57,11 @@ func (r _resource) createPodCreationTask(logger logr.Logger, pcs *grovecorev1alp
 					fmt.Sprintf("failed to create Pod: %s for PodClique %v", pod.Name, pclqObjKey),
 				)
 			}
-			logger.Info("Created Pod for PodClique", "podName", pod.Name, "podUID", pod.GetUID())
-			if err := r.expectationsStore.ExpectCreations(logger, pclqExpectationsKey, pod.GetUID()); err != nil {
-				utilruntime.HandleErrorWithLogger(logger, err, "could not record create expectations for Pod", "pclqObjKey", pclqObjKey, "pod", pod.Name)
-			}
-			r.eventRecorder.Eventf(pclq, corev1.EventTypeNormal, constants.ReasonPodCreateSuccessful, "Created Pod: %s", pod.Name)
+		logger.Info("Created Pod for PodClique", "podName", pod.Name, "podUID", pod.GetUID())
+		if err := r.expectationsStore.ExpectCreationsWithIndex(logger, pclqExpectationsKey, pod.GetUID(), podHostNameIndex); err != nil {
+			utilruntime.HandleErrorWithLogger(logger, err, "could not record create expectations for Pod", "pclqObjKey", pclqObjKey, "pod", pod.Name)
+		}
+		r.eventRecorder.Eventf(pclq, corev1.EventTypeNormal, constants.ReasonPodCreateSuccessful, "Created Pod: %s", pod.Name)
 			return nil
 		},
 	}

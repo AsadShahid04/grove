@@ -337,7 +337,13 @@ func (r _resource) buildPerPodGangCreationTasks(logger logr.Logger, ss *syncSnap
 	if totalToCreate == 0 {
 		return nil, nil
 	}
-	availableIndices, err := index.GetAvailableIndices(logger, ss.existingPCLQPods, int(totalToCreate))
+	// Collect reserved indices from in-flight creates not yet in the cache
+	reservedIndices, err := r.getReservedIndices(ss.pclq.ObjectMeta)
+	if err != nil {
+		return nil, groveerr.WrapError(err, errCodeGetAvailablePodHostNameIndices, component.OperationSync,
+			fmt.Sprintf("error collecting reserved indices for PodClique %v", client.ObjectKeyFromObject(ss.pclq)))
+	}
+	availableIndices, err := index.GetAvailableIndices(logger, ss.existingPCLQPods, reservedIndices, int(totalToCreate))
 	if err != nil {
 		return nil, groveerr.WrapError(err, errCodeGetAvailablePodHostNameIndices, component.OperationSync,
 			fmt.Sprintf("error getting available indices for Pods in PodClique %v", client.ObjectKeyFromObject(ss.pclq)))
