@@ -17,6 +17,9 @@ package pod
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -596,8 +599,6 @@ func TestReconcileStandalonePCLQDistributionCreateAndDelete(t *testing.T) {
 	t.Run("redistribution deletes from the shrinking anchor and creates on the growing anchor", func(t *testing.T) {
 		anchor1 := podGangNameForEpoch(testAnchor1Epoch)
 		pclq := newPCLQ(3)
-		// anchor0 currently holds all 3 pods; the redistribution moves to anchor0:1, anchor1:2. The live
-		// pods carry hostname indices so creating the replacements can pick free indices.
 		live := []*corev1.Pod{
 			nonTerminatingPodInPodGang("pod-a", anchor0, "worker-0"),
 			nonTerminatingPodInPodGang("pod-b", anchor0, "worker-1"),
@@ -618,7 +619,15 @@ func TestReconcileStandalonePCLQDistributionCreateAndDelete(t *testing.T) {
 		require.NoError(t, err)
 
 		assert.Len(t, listPodsForPodGang(t, cl, anchor0), 1)
-		assert.Len(t, listPodsForPodGang(t, cl, anchor1), 2)
+		anchor1Pods := listPodsForPodGang(t, cl, anchor1)
+		assert.Len(t, anchor1Pods, 2)
+		var gotIndices []int
+		for _, pod := range anchor1Pods {
+			podIndex, err := strconv.Atoi(pod.Spec.Hostname[strings.LastIndex(pod.Spec.Hostname, "-")+1:])
+			require.NoError(t, err)
+			gotIndices = append(gotIndices, podIndex)
+		}
+		assert.ElementsMatch(t, []int{1, 2}, gotIndices, "replacements should reuse the deleted Pods' indices 1 and 2")
 	})
 
 	t.Run("redistribution creates no replacements when the delete on the shrinking anchor fails", func(t *testing.T) {
@@ -642,6 +651,67 @@ func TestReconcileStandalonePCLQDistributionCreateAndDelete(t *testing.T) {
 		require.Error(t, err)
 		// Deletes run before creates, so a delete failure short-circuits before any replacement is created.
 		assert.Empty(t, listPodsForPodGang(t, cl, anchor1))
+	})
+
+	t.Run("coherent redistribution reuses replaced indices", func(t *testing.T) {
+		anchor1 := podGangNameForEpoch(testAnchor1Epoch)
+		for _, tc := range []struct {
+			name     string
+			replicas int32
+			entries  []grovecorev1alpha1.PodGangEntry
+		}{
+			{
+				name:     "three Pods, two move to the new anchor PodGang",
+				replicas: 3,
+				entries: []grovecorev1alpha1.PodGangEntry{
+					anchorEntryWithCliques(testAnchor0Epoch, map[string]int32{testCliqueName: 1}),
+					anchorEntryWithCliques(testAnchor1Epoch, map[string]int32{testCliqueName: 2}),
+				},
+			},
+			{
+				name:     "a one-Pod leader clique moves to the new anchor PodGang",
+				replicas: 1,
+				entries: []grovecorev1alpha1.PodGangEntry{
+					anchorEntryWithCliques(testAnchor1Epoch, map[string]int32{testCliqueName: 1}),
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				pclq := testutils.NewPodCliqueBuilder(testPCSName, "uid", testCliqueName, testNamespace, testPCSReplicaIndex).WithReplicas(tc.replicas).Build()
+				pclq.Spec.PodSpec = *podSpec.DeepCopy()
+				live := make([]*corev1.Pod, 0, tc.replicas)
+				objects := []client.Object{pclq}
+				wantIndices := make([]int, 0, tc.replicas)
+				for i := 0; i < int(tc.replicas); i++ {
+					pod := nonTerminatingPodInPodGang(fmt.Sprintf("old-%d", i), anchor0, fmt.Sprintf("%s-%d", pclq.Name, i))
+					live = append(live, pod)
+					objects = append(objects, pod)
+					wantIndices = append(wantIndices, i)
+				}
+				cl := testutils.NewTestClientBuilder().WithObjects(objects...).Build()
+				r := _resource{client: cl, scheme: cl.Scheme(), schedRegistry: registry, eventRecorder: record.NewFakeRecorder(64), expectationsStore: expect.NewExpectationsStore()}
+				ss := &syncSnapshot{
+					pcs: testPCS, pclq: pclq, pcsReplicaIndex: testPCSReplicaIndex, cliqueName: testCliqueName,
+					pgm:              pgmWithEntries(tc.entries...),
+					existingPCLQPods: live,
+				}
+
+				require.NoError(t, r.reconcileStandalonePCLQDistribution(context.Background(), logr.Discard(), ss))
+
+				var gotIndices []int
+				var hostnames []string
+				for _, podGangName := range []string{anchor0, anchor1} {
+					for _, pod := range listPodsForPodGang(t, cl, podGangName) {
+						hostnames = append(hostnames, podGangName+": "+pod.Spec.Hostname)
+						podIndex, err := strconv.Atoi(pod.Spec.Hostname[strings.LastIndex(pod.Spec.Hostname, "-")+1:])
+						require.NoError(t, err)
+						gotIndices = append(gotIndices, podIndex)
+					}
+				}
+				t.Logf("Pods after the pass: %v", hostnames)
+				assert.ElementsMatch(t, wantIndices, gotIndices, "replacements should reuse the indices of the Pods deleted in the same pass")
+			})
+		}
 	})
 }
 
@@ -741,13 +811,13 @@ func TestBuildPerPodGangCreationTasks(t *testing.T) {
 	ss := &syncSnapshot{pcs: pcs(), pclq: pclqWithReplicas(1), cliqueName: testCliqueName}
 
 	t.Run("builds one task per deficit pod across PodGangs", func(t *testing.T) {
-		tasks, err := r.buildPerPodGangCreationTasks(logr.Discard(), ss, map[string]int32{"pg-a": 2, "pg-b": 1}, []string{"pg-a", "pg-b"})
+		tasks, err := r.buildPerPodGangCreationTasks(logr.Discard(), ss, map[string]int32{"pg-a": 2, "pg-b": 1}, []string{"pg-a", "pg-b"}, nil)
 		require.NoError(t, err)
 		assert.Len(t, tasks, 3)
 	})
 
 	t.Run("builds no tasks when there is no deficit", func(t *testing.T) {
-		tasks, err := r.buildPerPodGangCreationTasks(logr.Discard(), ss, map[string]int32{"pg-a": -1}, []string{"pg-a"})
+		tasks, err := r.buildPerPodGangCreationTasks(logr.Discard(), ss, map[string]int32{"pg-a": -1}, []string{"pg-a"}, nil)
 		require.NoError(t, err)
 		assert.Nil(t, tasks)
 	})
