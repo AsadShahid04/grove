@@ -16,7 +16,9 @@ package clustertopology
 
 import (
 	"context"
+	"fmt"
 	"testing"
+	"time"
 
 	apicommonconstants "github.com/ai-dynamo/grove/operator/api/common/constants"
 	configv1alpha1 "github.com/ai-dynamo/grove/operator/api/config/v1alpha1"
@@ -34,6 +36,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -292,6 +295,139 @@ func TestBuildSchedulerReferenceMap(t *testing.T) {
 	assert.Equal(t, "kai-topo", m["kai-scheduler"].TopologyReference)
 	assert.Nil(t, m["nonexistent"])
 	assert.Empty(t, BuildSchedulerReferenceMap(nil))
+}
+
+// mockTimeoutError is a net.Error that reports Timeout() == true, mimicking a
+// transport-level dial timeout (e.g. API server rolling restart, network partition).
+type mockTimeoutError struct{ error }
+
+func (e mockTimeoutError) Error() string { return e.error.Error() }
+
+func (mockTimeoutError) Timeout() bool { return true }
+
+func (mockTimeoutError) Temporary() bool { return true }
+
+// transientListClient wraps a client.Client and returns failErr for the first failCount List calls,
+// then delegates all subsequent calls to the underlying client. Used to simulate transient API errors.
+type transientListClient struct {
+	client.Client
+	failCount int
+	callCount int
+	failErr   error
+}
+
+func (c *transientListClient) List(ctx context.Context, objList client.ObjectList, opts ...client.ListOption) error {
+	c.callCount++
+	if c.callCount <= c.failCount {
+		return c.failErr
+	}
+	return c.Client.List(ctx, objList, opts...)
+}
+
+// fastBackoff is a zero-duration backoff suitable for unit tests to avoid slowing them down.
+var fastBackoff = wait.Backoff{Duration: time.Millisecond, Factor: 1.0, Steps: 10}
+
+func TestSynchronizeTopologyWithRetry_SucceedsAfterTransientError(t *testing.T) {
+	ctx := context.Background()
+	ct := createTestClusterTopology(topologyName, []grovecorev1alpha1.TopologyLevel{
+		{Domain: grovecorev1alpha1.TopologyDomainHost, Key: "kubernetes.io/hostname"},
+	})
+	base := schedulertest.NewKAIClient(t, ct)
+
+	cl := &transientListClient{
+		Client:    base,
+		failCount: 2,
+		failErr:   apierrors.NewInternalError(assert.AnError),
+	}
+
+	err := SynchronizeTopologyWithRetry(ctx, cl, logr.Discard(), newKAIBackendMap(t, base), fastBackoff)
+	require.NoError(t, err)
+	assert.Equal(t, 3, cl.callCount, "expected 2 transient failures then 1 success")
+
+	kaiTopology := &kaitopologyv1alpha1.Topology{}
+	require.NoError(t, base.Get(ctx, client.ObjectKey{Name: topologyName}, kaiTopology))
+	assert.Len(t, kaiTopology.Spec.Levels, 1)
+}
+
+func TestSynchronizeTopologyWithRetry_PermanentErrorNotRetried(t *testing.T) {
+	ctx := context.Background()
+	permErr := apierrors.NewForbidden(schema.GroupResource{Resource: "clustertopologybindings"}, "", assert.AnError)
+	ctListGVK := grovecorev1alpha1.SchemeGroupVersion.WithKind("ClusterTopologyBindingList")
+	cl := testutils.NewTestClientBuilder().
+		WithScheme(schedulertest.NewKAIScheme(t)).
+		RecordErrorForObjectsMatchingLabels(testutils.ClientMethodList, client.ObjectKey{}, ctListGVK, nil, permErr).
+		Build()
+
+	countingCl := &transientListClient{Client: cl, failCount: 100, failErr: permErr}
+
+	err := SynchronizeTopologyWithRetry(ctx, countingCl, logr.Discard(), newKAIBackendMap(t, cl), fastBackoff)
+	require.Error(t, err)
+	assert.True(t, apierrors.IsForbidden(err), "expected Forbidden error to propagate")
+	assert.Equal(t, 1, countingCl.callCount, "permanent error should not be retried")
+}
+
+func TestSynchronizeTopologyWithRetry_ExhaustsRetriesOnPersistentTransientError(t *testing.T) {
+	ctx := context.Background()
+	transientErr := apierrors.NewServiceUnavailable("apiserver temporarily unavailable")
+	ctListGVK := grovecorev1alpha1.SchemeGroupVersion.WithKind("ClusterTopologyBindingList")
+	cl := testutils.NewTestClientBuilder().
+		WithScheme(schedulertest.NewKAIScheme(t)).
+		RecordErrorForObjectsMatchingLabels(testutils.ClientMethodList, client.ObjectKey{}, ctListGVK, nil, transientErr).
+		Build()
+
+	shortBackoff := wait.Backoff{Duration: time.Millisecond, Factor: 1.0, Steps: 3}
+	err := SynchronizeTopologyWithRetry(ctx, cl, logr.Discard(), newKAIBackendMap(t, cl), shortBackoff)
+	require.Error(t, err, "should fail after exhausting retry budget")
+	assert.True(t, apierrors.IsServiceUnavailable(err))
+}
+
+func TestSynchronizeTopologyWithRetry_ContextCanceledDuringBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ct := createTestClusterTopology(topologyName, []grovecorev1alpha1.TopologyLevel{
+		{Domain: grovecorev1alpha1.TopologyDomainHost, Key: "kubernetes.io/hostname"},
+	})
+	base := schedulertest.NewKAIClient(t, ct)
+
+	cl := &transientListClient{
+		Client:    base,
+		failCount: 100,
+		failErr:   apierrors.NewServiceUnavailable("service unavailable"),
+	}
+
+	longBackoff := wait.Backoff{Duration: 10 * time.Second, Factor: 1.0, Steps: 5}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- SynchronizeTopologyWithRetry(ctx, cl, logr.Discard(), newKAIBackendMap(t, base), longBackoff)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		assert.Equal(t, context.Canceled, err, "should return ctx.Err() when canceled during backoff")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for SynchronizeTopologyWithRetry to return after context cancellation")
+	}
+	assert.Equal(t, 1, cl.callCount, "should stop retrying after ctx cancel")
+}
+
+func TestSynchronizeTopologyWithRetry_TransportErrorRetried(t *testing.T) {
+	ctx := context.Background()
+	ct := createTestClusterTopology(topologyName, []grovecorev1alpha1.TopologyLevel{
+		{Domain: grovecorev1alpha1.TopologyDomainHost, Key: "kubernetes.io/hostname"},
+	})
+	base := schedulertest.NewKAIClient(t, ct)
+
+	cl := &transientListClient{
+		Client:    base,
+		failCount: 2,
+		failErr:   mockTimeoutError{error: fmt.Errorf("i/o timeout")},
+	}
+
+	err := SynchronizeTopologyWithRetry(ctx, cl, logr.Discard(), newKAIBackendMap(t, base), fastBackoff)
+	require.NoError(t, err)
+	assert.Equal(t, 3, cl.callCount, "expected 2 transient transport failures then 1 success")
 }
 
 func newKAIBackendMap(t *testing.T, cl client.Client) map[string]scheduler.TopologyAwareBackend {
