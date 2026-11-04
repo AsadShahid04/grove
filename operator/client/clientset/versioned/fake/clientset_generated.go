@@ -22,6 +22,8 @@ import (
 	clientset "github.com/ai-dynamo/grove/operator/client/clientset/versioned"
 	grovev1alpha1 "github.com/ai-dynamo/grove/operator/client/clientset/versioned/typed/core/v1alpha1"
 	fakegrovev1alpha1 "github.com/ai-dynamo/grove/operator/client/clientset/versioned/typed/core/v1alpha1/fake"
+	grovev1beta1 "github.com/ai-dynamo/grove/operator/client/clientset/versioned/typed/core/v1beta1"
+	fakegrovev1beta1 "github.com/ai-dynamo/grove/operator/client/clientset/versioned/typed/core/v1beta1/fake"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
@@ -71,7 +73,7 @@ type Clientset struct {
 	tracker   testing.ObjectTracker
 }
 
-func (c *Clientset) Discovery() discovery.DiscoveryInterface {
+func (c *Clientset) Discovery() discovery.DiscoveryInterfaces {
 	return c.discovery
 }
 
@@ -79,7 +81,7 @@ func (c *Clientset) Tracker() testing.ObjectTracker {
 	return c.tracker
 }
 
-// IsWatchListSemanticsSupported informs the reflector that this client
+// IsWatchListSemanticsUnSupported informs the reflector that this client
 // doesn't support WatchList semantics.
 //
 // This is a synthetic method whose sole purpose is to satisfy the optional
@@ -98,4 +100,9 @@ var (
 // GroveV1alpha1 retrieves the GroveV1alpha1Client
 func (c *Clientset) GroveV1alpha1() grovev1alpha1.GroveV1alpha1Interface {
 	return &fakegrovev1alpha1.FakeGroveV1alpha1{Fake: &c.Fake}
+}
+
+// GroveV1beta1 retrieves the GroveV1beta1Client
+func (c *Clientset) GroveV1beta1() grovev1beta1.GroveV1beta1Interface {
+	return &fakegrovev1beta1.FakeGroveV1beta1{Fake: &c.Fake}
 }
